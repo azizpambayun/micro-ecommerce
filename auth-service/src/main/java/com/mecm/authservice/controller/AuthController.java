@@ -10,6 +10,9 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.HashMap;
+import java.util.Map;
+
 @RestController
 @RequestMapping("/api/auth")
 @CrossOrigin(origins = "*", maxAge = 3600)
@@ -103,12 +106,18 @@ public class AuthController {
 
     @PostMapping("/logout")
     @PreAuthorize("hasRole('USER') or hasRole('ADMIN')")
-    public ResponseEntity<ApiResponse<String>> logoutUser() {
+    public ResponseEntity<ApiResponse<String>> logoutUser(
+            @RequestHeader(value = "Authorization", required = false) String bearerToken) {
 
         log.debug("Logout request");
 
         try {
-            String message = authService.logoutUser();
+            String token = null;
+            if (bearerToken != null && !bearerToken.isEmpty()) {
+                token = extractTokenfromBearerString(bearerToken);
+            }
+
+            String message = authService.logoutUser(token);
             ApiResponse<String> response = ApiResponse.success(message);
             log.debug("Logout successful");
             return new ResponseEntity<>(response, HttpStatus.OK);
@@ -119,22 +128,37 @@ public class AuthController {
     }
 
     @PostMapping("/validate-token")
-    public ResponseEntity<ApiResponse<Boolean>> validateToken(
+    public ResponseEntity<ApiResponse<Map<String, Object>>> validateToken(
             @RequestBody TokenValidationRequest request) {
         log.debug("Token validation request");
 
         try {
-            boolean isValid = authService.validateToken(request.getToken());
-            ApiResponse<Boolean> response = ApiResponse.success(
-                    isValid ? "Token is valid" : "Token is invalid", isValid
+            AuthService.TokenValidationResult validationResult = 
+                    authService.validateTokenWithReason(request.getToken());
+
+            Map<String, Object> responseData = new HashMap<>();
+            responseData.put("valid", validationResult.isValid());
+            responseData.put("reason", validationResult.getReason());
+
+            ApiResponse<Map<String, Object>> response = ApiResponse.success(
+                    validationResult.getReason(),
+                    responseData
             );
 
-            log.debug("Token validation result: {}", isValid);
+            log.debug("Token validation result: {} - Reason: {}", 
+                    validationResult.isValid(), validationResult.getReason());
+
             return new ResponseEntity<>(response, HttpStatus.OK);
+
         } catch (Exception ex) {
             log.error("Token validation failed: {}", ex.getMessage());
-            ApiResponse<Boolean> failedResponse = ApiResponse.success(
-                    "Token validation failed", false
+
+            Map<String, Object> errorData = new HashMap<>();
+            errorData.put("valid", false);
+            errorData.put("reason", "Token validation error");
+
+            ApiResponse<Map<String, Object>> failedResponse = ApiResponse.success(
+                    "Token validation failed", errorData
             );
             return new ResponseEntity<>(failedResponse, HttpStatus.OK);
         }
@@ -168,6 +192,67 @@ public class AuthController {
         return new ResponseEntity<>(response, HttpStatus.OK);
     }
 
+    @PostMapping("/check-token-status")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> checkTokenStatus(
+            @RequestBody TokenValidationRequest request) {
+        log.debug("Token status check request");
+
+        try {
+            String token = request.getToken();
+            Map<String, Object> statusData = new HashMap<>();
+
+            // Check if token is null or empty
+            if (token == null || token.isEmpty()) {
+                statusData.put("exists", false);
+                statusData.put("valid", false);
+                statusData.put("revoked", false);
+                statusData.put("message", "Token is null or empty");
+            } else {
+                statusData.put("exists", true);
+
+                // Check if token is revoked
+                boolean isRevoked = authService.validateToken(token); // This checks revocation internally
+                AuthService.TokenValidationResult validationResult = 
+                        authService.validateTokenWithReason(token);
+
+                statusData.put("valid", validationResult.isValid());
+                statusData.put("revoked", validationResult.getReason().contains("revoked"));
+                statusData.put("message", validationResult.getReason());
+
+                // Add additional token info if valid
+                if (validationResult.isValid()) {
+                    try {
+                        long remainingTime = authService.validateToken(token) ? 1 : 0; // Simplified
+                        statusData.put("hasRemainingTime", remainingTime > 0);
+                    } catch (Exception e) {
+                        log.warn("Could not get remaining time: {}", e.getMessage());
+                    }
+                }
+            }
+
+            ApiResponse<Map<String, Object>> response = ApiResponse.success(
+                    "Token status retrieved successfully", 
+                    statusData
+            );
+
+            log.debug("Token status check completed");
+            return new ResponseEntity<>(response, HttpStatus.OK);
+
+        } catch (Exception ex) {
+            log.error("Token status check failed: {}", ex.getMessage());
+
+            Map<String, Object> errorData = new HashMap<>();
+            errorData.put("exists", false);
+            errorData.put("valid", false);
+            errorData.put("revoked", false);
+            errorData.put("message", "Error checking token status");
+
+            ApiResponse<Map<String, Object>> failedResponse = ApiResponse.success(
+                    "Token status check failed", errorData
+            );
+            return new ResponseEntity<>(failedResponse, HttpStatus.OK);
+        }
+    }
 
     private String extractTokenfromBearerString(String bearerToken) {
         if (bearerToken != null && bearerToken.startsWith("Bearer ")) {

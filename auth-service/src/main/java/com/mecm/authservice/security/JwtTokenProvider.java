@@ -1,5 +1,7 @@
 package com.mecm.authservice.security;
 
+import java.time.Instant;
+
 import io.jsonwebtoken.*;
 import io.jsonwebtoken.security.Keys;
 import lombok.Getter;
@@ -69,13 +71,18 @@ public class JwtTokenProvider {
                 .compact();
     }
 
+    // Helper method to extract claims from token (DRY principle)
+    private Claims getClaimsFromToken(String token) {
+        return Jwts.parser()
+                .verifyWith(getSigningKey())
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
     public String getUsernameFromToken(String token) {
         try {
-            Claims claims = Jwts.parser()
-                    .verifyWith(getSigningKey())
-                    .build()
-                    .parseSignedClaims(token)
-                    .getPayload();
+            Claims claims = getClaimsFromToken(token);
             return claims.getSubject();
         } catch (Exception ex) {
             log.error("Error parsing token: ", ex);
@@ -83,14 +90,14 @@ public class JwtTokenProvider {
         }
     }
 
-    public Date getExpirationDateFromToken(String token) {
-        Claims claims = Jwts.parser()
-                .verifyWith(getSigningKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-
-        return claims.getExpiration();
+    public Instant getExpirationDateFromToken(String token) {
+        try {
+            Claims claims = getClaimsFromToken(token);
+            return claims.getExpiration().toInstant();
+        } catch (Exception ex) {
+            log.error("Error getting expiration date from token: {}", ex.getMessage());
+            throw ex;
+        }
     }
 
     public boolean validateToken(String authToken) {
@@ -118,8 +125,8 @@ public class JwtTokenProvider {
 
     public boolean isTokenExpired(String token) {
         try {
-            Date expiration = getExpirationDateFromToken(token);
-            return expiration.before(new Date());
+            Instant expiration = getExpirationDateFromToken(token);
+            return expiration.isBefore(Instant.now());
         } catch (Exception ex) {
             log.error("Error checking token expiration: {}", ex.getMessage());
             return true;
@@ -128,8 +135,8 @@ public class JwtTokenProvider {
 
     public long getRemainingTimeInMs(String token) {
         try {
-            Date expiration = getExpirationDateFromToken(token);
-            long remainingTime = expiration.getTime() - System.currentTimeMillis();
+            Instant expiration = getExpirationDateFromToken(token);
+            long remainingTime = expiration.toEpochMilli() - System.currentTimeMillis();
             return Math.max(remainingTime, 0);
         } catch (Exception ex) {
             log.error("Error getting remaining time: {}", ex.getMessage());
@@ -139,11 +146,7 @@ public class JwtTokenProvider {
 
     public List<String> getRolesFromToken(String token) {
         try {
-            Claims claims = Jwts.parser()
-                    .verifyWith(getSigningKey())
-                    .build()
-                    .parseSignedClaims(token)
-                    .getPayload();
+            Claims claims = getClaimsFromToken(token);
             List<String> roles = claims.get("roles", List.class);
             return roles != null ? roles : new ArrayList<>();
         } catch (Exception e) {

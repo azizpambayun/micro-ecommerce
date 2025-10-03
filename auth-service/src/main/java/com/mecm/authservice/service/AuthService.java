@@ -10,6 +10,7 @@ import com.mecm.authservice.model.Role;
 import com.mecm.authservice.model.User;
 import com.mecm.authservice.repository.UserRepository;
 import com.mecm.authservice.security.JwtTokenProvider;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.authentication.AuthenticationManager;
@@ -33,6 +34,7 @@ public class AuthService {
     private final UserRepository userRepository;
     private final JwtTokenProvider jwtTokenProvider;
     private final PasswordEncoder passwordEncoder;
+    private final TokenRevocationService tokenRevocationService;
 
     public JwtAuthenticationResponse authenticateUser(LoginRequest loginRequest) {
         log.info("Attempting authentication for user: {}", loginRequest.getUsernameOrEmail());
@@ -131,11 +133,35 @@ public class AuthService {
     @Transactional(readOnly = true)
     public boolean validateToken(String token) {
         try {
-            if (jwtTokenProvider.validateToken(token)) {
-                String username = jwtTokenProvider.getUsernameFromToken(token);
-                return userRepository.findByUsername(username).isPresent();
+            if (token == null || token.isEmpty()) {
+                log.warn("Token validation failed - Token is null or empty");
+                return false;
             }
-            return false;
+
+            // Check if token is revoked first (most important check)
+            if (tokenRevocationService.isTokenRevoked(token)) {
+                log.warn("Token validation failed - Token has been revoked");
+                return false;
+            }
+
+            // Then validate token structure and expiration
+            if (!jwtTokenProvider.validateToken(token)) {
+                log.warn("Token validation failed - Token is invalid or expired");
+                return false;
+            }
+
+            // Finally check if user still exists
+            String username = jwtTokenProvider.getUsernameFromToken(token);
+            boolean userExists = userRepository.findByUsername(username).isPresent();
+
+            if (!userExists) {
+                log.warn("Token validation failed - User {} not found", username);
+            } else {
+                log.debug("Token validation successful for user: {}", username);
+            }
+
+            return userExists;
+
         } catch (Exception ex) {
             log.error("Token validation error: {}", ex.getMessage());
             return false;
@@ -143,6 +169,11 @@ public class AuthService {
     }
 
     public JwtAuthenticationResponse refreshToken(String token) {
+        // Check if token is already revoked
+        if (tokenRevocationService.isTokenRevoked(token)) {
+            throw new BadRequestException("Token has already been used or revoked");
+        }
+
         if (!jwtTokenProvider.validateToken(token)) {
             throw new BadRequestException("Token is invalid or expired");
         }
@@ -151,20 +182,29 @@ public class AuthService {
         User user = userRepository.findByUsername(username)
                 .orElseThrow(() -> new ResourceNotFoundException("User not found"));
 
+        // Revoke the old token before generating a new one
+        tokenRevocationService.revokeToken(token, "TOKEN_REFRESH");
+
         String newToken = jwtTokenProvider.generateTokenFromUsername(username);
         Long expiresIn = jwtTokenProvider.getRemainingTimeInMs(newToken) / 1000;
         UserInfo userInfo = createUserInfo(user);
 
-        log.info("Token refreshed for user: {}", username);
+        log.info("Token refreshed for user: {} - Old token revoked", username);
 
         return new JwtAuthenticationResponse(newToken, expiresIn, userInfo);
     }
 
-    public String logoutUser() {
+    public String logoutUser(String token) {
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
 
         if (authentication != null && authentication.isAuthenticated()) {
             User user = (User) authentication.getPrincipal();
+
+            // Revoke the token on logout
+            if (token != null && !token.isEmpty()) {
+                tokenRevocationService.revokeToken(token, "LOGOUT");
+            }
+
             log.info("User logged out: {}", user.getUsername());
 
             SecurityContextHolder.clearContext();
@@ -207,5 +247,50 @@ public class AuthService {
                 .orElseThrow(() -> new ResourceNotFoundException("User not found"));
     }
 
+    @Transactional(readOnly = true)
+    public TokenValidationResult validateTokenWithReason(String token) {
+        try {
+            if (token == null || token.isEmpty()) {
+                return new TokenValidationResult(false, "Token is null or empty");
+            }
+
+            // Check if token is revoked
+            if (tokenRevocationService.isTokenRevoked(token)) {
+                return new TokenValidationResult(false, "Token has been revoked");
+            }
+
+            // Validate token structure and expiration
+            if (!jwtTokenProvider.validateToken(token)) {
+                return new TokenValidationResult(false, "Token is invalid or expired");
+            }
+
+            // Check if user exists
+            String username = jwtTokenProvider.getUsernameFromToken(token);
+            boolean userExists = userRepository.findByUsername(username).isPresent();
+
+            if (!userExists) {
+                return new TokenValidationResult(false, "User not found");
+            }
+
+            return new TokenValidationResult(true, "Token is valid");
+
+        } catch (Exception ex) {
+            log.error("Token validation error: {}", ex.getMessage());
+            return new TokenValidationResult(false, "Token validation error: " + ex.getMessage());
+        }
+    }
+
+    // Inner class for detailed validation result
+    @Getter
+    public static class TokenValidationResult {
+        private final boolean valid;
+        private final String reason;
+
+        public TokenValidationResult(boolean valid, String reason) {
+            this.valid = valid;
+            this.reason = reason;
+        }
+
+    }
 
 }
